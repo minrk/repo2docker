@@ -66,6 +66,9 @@ class RBuildPack(PythonBuildPack):
         Will return the version specified by the user or the current default
         version.
         """
+        if hasattr(self, "_r_version"):
+            return self._r_version
+
         version_map = {
             "3.4": "3.4",
             "3.5": "3.5.3-1bionic",
@@ -76,25 +79,34 @@ class RBuildPack(PythonBuildPack):
             "3.6": "3.6.3-1bionic",
             "3.6.0": "3.6.0-2bionic",
             "3.6.1": "3.6.1-3bionic",
-            "4.0": "4.0.5-1.1804.0",
-            "4.0.2": "4.0.2-1.1804.0",
-            "4.1": "4.1.2-1.1804.0",
+            "3.6.3": "3.6.3-1bionic",
+            "4.0": "4.0.5",
+            "4.1": "4.1.2",
         }
         # the default if nothing is specified
         r_version = "4.1"
 
-        if not hasattr(self, "_r_version"):
-            parts = self.runtime.split("-")
-            if len(parts) == 5:
-                r_version = parts[1]
-                if r_version not in version_map:
-                    raise ValueError(
-                        "Version '{}' of R is not supported.".format(r_version)
-                    )
+        # allow arbitrary r 4.y.z, as long as it's fully specified
+        arbitrary_r4_pat = re.compile(r"4\.(\d+)\.(\d+)$")
+        self._r_pinned = False
 
-            # translate to the full version string
-            self._r_version = version_map.get(r_version)
+        parts = self.runtime.split("-")
+        if len(parts) == 5:
+            r_version = parts[1]
+            # pinning R version ensures a specific version is installed
+            # in addition to 'latest stable', which will always be
+            # installed for rstudio itself
+            self._r_pinned = True
 
+            if (
+                r_version
+                and r_version not in version_map
+                and not arbitrary_r4_pat.match(r_version)
+            ):
+                raise ValueError(f"Version '{r_version}' of R is not supported.")
+
+        # translate to the full version string
+        self._r_version = version_map.get(r_version, r_version)
         return self._r_version
 
     @property
@@ -175,13 +187,14 @@ class RBuildPack(PythonBuildPack):
             "libapparmor1",
             "sudo",
             "lsb-release",
+            "libclang-dev",
+            "libzmq3-dev",
         ]
         # For R 3.4 we use the default Ubuntu package, for other versions we
         # install from a different apt repository
         if V(self.r_version) < V("3.5"):
             packages.append("r-base")
             packages.append("r-base-dev")
-            packages.append("libclang-dev")
 
         return super().get_packages().union(packages)
 
@@ -267,21 +280,55 @@ class RBuildPack(PythonBuildPack):
 
         cran_mirror_url = self.get_cran_mirror_url(self.checkpoint_date)
 
+        scripts = []
+        r_version = self.r_version
         # Determine which R apt repository should be enabled
-        if V(self.r_version) >= V("3.5"):
-            if V(self.r_version) >= V("4"):
-                vs = "40"
-            else:
-                vs = "35"
+        # R 3.4 uses 'bionic', while 3.5 and 3.6 use 'bionic-cran35'
+        # R 4.0, 4.1 use 'bionic-cran40'
 
-        scripts = [
+        # For R 3.x, we get pinned r-base, etc.
+        # For R 4.x, we get 'latest stable' `r-base` 4.x with rstudio-server,
+        # and if a specific version of R is requested we get an _additional_ R in /opt/R/{$R_VERSION}
+        # from the RStudio-maintained builds
+
+        if V(self.r_version) >= V("4"):
+            apt_suffix = "-cran40"
+            r_pkg_pin = ""
+            if self._r_pinned:
+                # R 4.x, pinned R version use RStudio builds of R
+                # follow steps in https://docs.rstudio.com/resources/install-r/#specify-r-version
+                scripts += [
+                    (
+                        "root",
+                        fr"""
+                        curl --silent --location --fail https://cdn.rstudio.com/r/ubuntu-1804/pkgs/r-{r_version}_1_amd64.deb > r.deb && \
+                        apt-get update > /dev/null && \
+                        apt --yes install ./r.deb && \
+                        apt-get -qq purge && \
+                        apt-get -qq clean && \
+                        rm -rf /var/lib/apt/lists/* \
+                        rm r.deb && \
+                        ln -s /opt/R/{r_version}/bin/R /usr/local/bin/R && \
+                        ln -s /opt/R/{r_version}/bin/Rscript /usr/local/bin/Rscript
+                        """,
+                    )
+                ]
+        else:
+            # R 3.x, single R install with r-base pinned via apt
+            if V(self.r_version) >= V("3.5"):
+                apt_suffix = "-cran35"
+            else:
+                apt_suffix = ""
+            r_pkg_pin = f"={r_version}"
+
+        scripts += [
             (
                 "root",
                 rf"""
-                echo "deb https://cloud.r-project.org/bin/linux/ubuntu bionic-cran{vs}/" > /etc/apt/sources.list.d/r-ubuntu.list
+                echo "deb https://cloud.r-project.org/bin/linux/ubuntu bionic{apt_suffix}/" > /etc/apt/sources.list.d/r-ubuntu.list
                 """,
             ),
-            # Dont use apt-key directly, as gpg does not always respect *_proxy vars. This increase the chances
+            # Don't use apt-key directly, as gpg does not always respect *_proxy vars. This increase the chances
             # of being able to reach it from behind a firewall
             (
                 "root",
@@ -291,19 +338,17 @@ class RBuildPack(PythonBuildPack):
             ),
             (
                 "root",
-                r"""
+                rf"""
                 apt-get update > /dev/null && \
-                apt-get install --yes r-base={R_version} r-base-core={R_version} \
-                        r-base-dev={R_version} \
-                        r-recommended={R_version} \
-                        libclang-dev \
-                        libzmq3-dev > /dev/null && \
+                apt-get install --yes \
+                    r-base{r_pkg_pin} \
+                    r-base-core{r_pkg_pin} \
+                    r-base-dev{r_pkg_pin} \
+                    r-recommended{r_pkg_pin} > /dev/null && \
                 apt-get -qq purge && \
                 apt-get -qq clean && \
                 rm -rf /var/lib/apt/lists/*
-                """.format(
-                    R_version=self.r_version
-                ),
+                """,
             ),
         ]
 
@@ -335,10 +380,10 @@ class RBuildPack(PythonBuildPack):
                 # See https://docs.rstudio.com/rspm/1.0.12/admin/binaries.html
                 # Set mirror for RStudio too, by modifying rsession.conf
                 r"""
-                R RHOME && \
-                mkdir -p /usr/lib/R/etc /etc/rstudio && \
-                echo 'options(repos = c(CRAN = "{cran_mirror_url}"))' > /usr/lib/R/etc/Rprofile.site && \
-                echo 'options(HTTPUserAgent = sprintf("R/%s R (%s)", getRversion(), paste(getRversion(), R.version$platform, R.version$arch, R.version$os)))' >> /usr/lib/R/etc/Rprofile.site && \
+                export R_HOME=$(R RHOME) && \
+                mkdir -p $R_HOME/etc /etc/rstudio && \
+                echo 'options(repos = c(CRAN = "{cran_mirror_url}"))' > $R_HOME/etc/Rprofile.site && \
+                echo 'options(HTTPUserAgent = sprintf("R/%s R (%s)", getRversion(), paste(getRversion(), R.version$platform, R.version$arch, R.version$os)))' >> $R_HOME/etc/Rprofile.site && \
                 echo 'r-cran-repos={cran_mirror_url}' > /etc/rstudio/rsession.conf
                 """.format(
                     cran_mirror_url=cran_mirror_url
