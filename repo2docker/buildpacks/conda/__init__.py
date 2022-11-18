@@ -49,6 +49,7 @@ class CondaBuildPack(BaseImage):
             self.get_build_script_files()
 
         env = super().get_build_env() + [
+            ("PIP_VERBOSE", "2"),
             ("CONDA_DIR", "${APP_BASE}/conda"),
             ("NB_PYTHON_PREFIX", "${CONDA_DIR}/envs/notebook"),
             # We install npm / node from conda-forge
@@ -343,6 +344,7 @@ class CondaBuildPack(BaseImage):
                     "${NB_USER}",
                     rf"""
                 TIMEFORMAT='time: %3R' \
+                PIP_VERBOSE=2 \
                 bash -c 'time ${{MAMBA_EXE}} env update -p {env_prefix} --file "{environment_yml}" && \
                 time ${{MAMBA_EXE}} clean --all -f -y && \
                 ${{MAMBA_EXE}} list -p {env_prefix} \
